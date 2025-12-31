@@ -1,204 +1,118 @@
-const { Client, LocalAuth } = require('whatsapp-web.js');
+const { default: makeWASocket, DisconnectReason, useMultiFileAuthState } = require('@whiskeysockets/baileys');
 const qrcode = require('qrcode-terminal');
-const fs = require('fs');
 const express = require('express');
-const app = express();
+const fs = require('fs');
+const path = require('path');
 
-// Middleware
+const app = express();
 app.use(express.json());
 
-// Inicializar el cliente de WhatsApp
-const client = new Client({
-    authStrategy: new LocalAuth()
+// ✅ RUTA QR CLARA PARA RENDER (PEGAR PRIMERO)
+app.get('/', async (req, res) => {
+  if (client.info) {
+    res.send(`🤖 Bot CONECTADO!\n👥 ${client.info.pushname}\n📱 Listo para .reg 100`);
+  } else if (qr) {
+    res.type('html').send(`
+      <html>
+        <body style="background:#000; color:#fff; font-family:Arial; text-align:center; padding:20px;">
+          <h1>🤖 Bot WhatsApp 24/7</h1>
+          <div style="display:inline-block; margin:20px;">
+            <pre style="font-size:28px; line-height:1.1; letter-spacing:0.5px; background:#111; padding:20px; border-radius:10px;">${qr}</pre>
+          </div>
+          <p>📱 WhatsApp → ⋮ → Dispositivos vinculados → Escanear QR</p>
+          <hr>
+          <p><small>Render.com Live: ${req.headers.host}</small></p>
+        </body>
+      </html>
+    `);
+  } else {
+    res.send('⏳ Iniciando bot... Espera QR (1-2 min)');
+  }
 });
 
-// Servidor webhook puerto 3000 para ngrok
-app.listen(3000, () => {
-    console.log('✅ Servidor webhook en puerto 3000');
-});
+let client;
+let qr = null;
 
-// Archivo para guardar los pagos y estado del grupo
-const PAGOS_FILE = 'pagos.json';
+// PAGOS (TODOS PUEDEN USAR - SIN ADMINS)
+const pagos = [];
 
-// Cargar pagos existentes o crear archivo nuevo
-let pagosData = {};
-if (fs.existsSync(PAGOS_FILE)) {
-    pagosData = JSON.parse(fs.readFileSync(PAGOS_FILE, 'utf8'));
-}
+// INICIAR BOT
+async function startBot() {
+  const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
+  
+  client = makeWASocket({
+    auth: state,
+    printQRInTerminal: false,
+  });
 
-// Lista de administradores (PON TU NÚMERO COMPLETO)
-const ADMIN_NUMEROS = [
-    '5213312345678@c.us'  // ← CAMBIA POR TU NÚMERO COMPLETO
-];
+  client.ev.on('creds.update', saveCreds);
 
-// Función para verificar si es admin
-function esAdmin(msg) {
-    const numeroUsuario = msg.author || msg.from;
-    return ADMIN_NUMEROS.includes(numeroUsuario);
-}
-
-// Función para verificar cierre automático (CORREGIDA)
-function verificarCierreAutomatico(chatId) {
-    if (!pagosData[chatId] || !pagosData[chatId].horaCierre) return;
-    
-    const ahora = new Date();
-    const [hora, minuto] = pagosData[chatId].horaCierre.split(':');
-    const horaCierre = new Date();
-    horaCierre.setHours(parseInt(hora), parseInt(minuto), 0, 0);
-    
-    // Verificar si ya pasó la hora de cierre HOY
-    if (ahora >= horaCierre && pagosData[chatId].grupoAbierto) {
-        pagosData[chatId].grupoAbierto = false;
-        const total = pagosData[chatId].total || 0;
-        fs.writeFileSync(PAGOS_FILE, JSON.stringify(pagosData, null, 2));
-        
-        client.getChatById(chatId).then(chat => {
-            const horaActual = ahora.toLocaleTimeString('es-MX');
-            chat.sendMessage(`⏰ *Grupo cerrado automáticamente a las ${horaActual}*\n\n🔒 No se pueden recibir más pagos\n💰 *Total:* ${total}`);
-        });
-        console.log(`Grupo ${chatId} cerrado automáticamente`);
+  client.ev.on('connection.update', (update) => {
+    const { connection, lastDisconnect } = update;
+    if (connection === 'close') {
+      console.log('🔌 Desconectado:', lastDisconnect.error);
+      startBot();
+    } else if (connection === 'open') {
+      console.log('✅ Cliente conectado!');
     }
-}
+  });
 
-// Generar código QR
-client.on('qr', (qr) => {
-    console.log('📱 Escanea este código QR con tu WhatsApp:');
+  client.ev.on('qr', (qrcodeData) => {
+    qr = qrcodeData;
+    console.log('📱 Escanea este QR con WhatsApp:');
     qrcode.generate(qr, { small: true });
-});
+  });
 
-client.on('ready', () => {
-    console.log('✅ Bot de WhatsApp listo!');
+  client.ev.on('messages.upsert', async (m) => {
+    const msg = m.messages[0];
+    if (!msg.message) return;
     
-    // Verificar cierres cada 30 segundos
-    setInterval(() => {
-        Object.keys(pagosData).forEach(chatId => verificarCierreAutomatico(chatId));
-    }, 30000);
+    const from = msg.key.remoteJid;
+    const text = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
+    const sender = msg.key.participant || msg.key.remoteJid;
+    
+    if (!text.startsWith('.')) return;
+
+    const command = text.slice(1).split(' ')[0].toLowerCase();
+    const args = text.slice(1).split(' ').slice(1);
+
+    console.log(`📨 ${command} de ${sender}`);
+
+    // .reg MONTO
+    if (command === 'reg') {
+      const monto = parseFloat(args[0]);
+      if (isNaN(monto) || monto <= 0) {
+        await client.sendMessage(from, { text: '❌ Usa: .reg 100' });
+        return;
+      }
+      pagos.push({ monto, fecha: new Date(), usuario: sender });
+      await client.sendMessage(from, { text: `✅ Pago Registrado: $${monto} MXN` });
+    }
+
+    // .conteo
+    if (command === 'conteo') {
+      const total = pagos.reduce((sum, p) => sum + p.monto, 0);
+      const count = pagos.length;
+      await client.sendMessage(from, { text: `📊 Total: $${total} MXN (${count} pagos)` });
+    }
+
+    // .menu (TODOS)
+    if (command === 'menu') {
+      await client.sendMessage(from, { 
+        text: `📋 *MENÚ BOT PAGOS 24/7*\n\n` +
+              `• *.reg 100* → Registrar pago\n` +
+              `• *.conteo* → Total recaudado\n` +
+              `• *.menu* → Este menú\n\n` +
+              `🤖 Bot en Render.com - Siempre activo!`
+      });
+    }
+  });
+}
+
+// INICIAR SERVIDOR
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`✅ Servidor webhook en puerto ${PORT}`);
+  startBot();
 });
 
-client.on('message', async (msg) => {
-    const mensaje = msg.body.trim().toLowerCase();
-    const chatId = msg.from;
-    const esAdminUsuario = esAdmin(msg);
-
-    // Comando .reg (TODOS)
-    if (mensaje.startsWith('.reg ')) {
-        const grupoAbierto = pagosData[chatId] ? pagosData[chatId].grupoAbierto : true;
-        
-        if (!grupoAbierto) {
-            await msg.reply('❌ Grupo cerrado. No se pueden registrar más pagos.');
-            return;
-        }
-
-        const cantidad = msg.body.substring(5).trim();
-        const numero = parseFloat(cantidad);
-
-        if (isNaN(numero)) {
-            await msg.reply('❌ Número inválido. Ej: .reg 100');
-            return;
-        }
-
-        if (!pagosData[chatId]) {
-            pagosData[chatId] = { grupoAbierto: true, pagos: [], total: 0 };
-        }
-
-        const pago = {
-            cantidad: numero,
-            fecha: new Date().toISOString(),
-            usuario: msg.author || msg.from
-        };
-        
-        pagosData[chatId].pagos.push(pago);
-        pagosData[chatId].total += numero;
-        fs.writeFileSync(PAGOS_FILE, JSON.stringify(pagosData, null, 2));
-        
-        await msg.reply('✅ Pago Registrado');
-        return;
-    }
-
-    // Comando .conteo (TODOS)
-    if (mensaje === '.conteo') {
-        if (!pagosData[chatId] || pagosData[chatId].total === 0) {
-            const horaCierre = pagosData[chatId]?.horaCierre || 'Sin programar';
-            await msg.reply(`Conteo Final: 0 🤝🏻🧾\n⏰ Cierre: ${horaCierre}`);
-        } else {
-            const total = pagosData[chatId].total;
-            const estado = pagosData[chatId].grupoAbierto ? '🟢 Abierto' : '🔴 Cerrado';
-            const horaCierre = pagosData[chatId]?.horaCierre || 'Sin programar';
-            await msg.reply(`Conteo Final: ${total} ${estado} 🤝🏻🧾\n⏰ Cierre: ${horaCierre}`);
-        }
-        return;
-    }
-
-    // COMANDOS SOLO PARA ADMINS
-    if (!esAdminUsuario) {
-        await msg.reply('❌ Solo administradores pueden usar este comando.');
-        return;
-    }
-
-    // Comando .grupo (ADMINS)
-    if (mensaje === '.grupo') {
-        if (!pagosData[chatId]) {
-            pagosData[chatId] = { grupoAbierto: true, pagos: [], total: 0 };
-        } else {
-            pagosData[chatId].grupoAbierto = true;
-            delete pagosData[chatId].horaCierre;
-        }
-        fs.writeFileSync(PAGOS_FILE, JSON.stringify(pagosData, null, 2));
-        await msg.reply('✅ Grupo abierto');
-        return;
-    }
-
-    // Comando .close (ADMINS) - CORREGIDO
-    if (mensaje.startsWith('.close ')) {
-        const horaCierre = msg.body.substring(7).trim();
-        if (!/^\d{1,2}:\d{2}$/.test(horaCierre)) {
-            await msg.reply('❌ Formato: .close 23:30');
-            return;
-        }
-        
-        if (!pagosData[chatId]) {
-            pagosData[chatId] = { grupoAbierto: true, pagos: [], total: 0, horaCierre };
-        } else {
-            pagosData[chatId].horaCierre = horaCierre;
-        }
-        
-        fs.writeFileSync(PAGOS_FILE, JSON.stringify(pagosData, null, 2));
-        await msg.reply(`⏰ Grupo se cerrará a las ${horaCierre}`);
-        return;
-    }
-
-    // Comando .borrar (ADMINS)
-    if (mensaje === '.borrar') {
-        if (pagosData[chatId]) {
-            delete pagosData[chatId];
-            fs.writeFileSync(PAGOS_FILE, JSON.stringify(pagosData, null, 2));
-        }
-        await msg.reply('💥 Registros Eliminados');
-        return;
-    }
-
-    // Comando .menu (ADMINS)
-    if (mensaje === '.menu') {
-        const estado = pagosData[chatId] && pagosData[chatId].grupoAbierto ? '🟢 ABIERTO' : '🔴 CERRADO';
-        const horaCierre = pagosData[chatId]?.horaCierre || 'Sin programar';
-        const menu = `🤖 *MENÚ DE COMANDOS*
-
-📊 Estado: ${estado}
-⏰ Cierre: ${horaCierre}
-
-✅ *TODOS:*
-• .reg 100
-• .conteo
-
-🔒 *ADMINS:*
-• .grupo
-• .close 23:30
-• .borrar
-• .menu`;
-        await msg.reply(menu);
-        return;
-    }
-});
-
-// Inicializar
-client.initialize();
